@@ -10,12 +10,16 @@ use std::process::Command;
 #[command(about = "Find out who is responsible for a file or folder")]
 struct Args {
     /// Files, folders, or glob patterns to analyze (e.g., foo.rs bar.rs "**/*.rs")
-    #[arg(required = true)]
+    #[arg(required_unless_present = "upgrade")]
     patterns: Vec<String>,
 
     /// Show detailed breakdown by contributor
     #[arg(short, long)]
     verbose: bool,
+
+    /// Upgrade blame to the latest version
+    #[arg(long)]
+    upgrade: bool,
 }
 
 #[derive(Default)]
@@ -26,6 +30,11 @@ struct AuthorStats {
 
 fn main() {
     let args = Args::parse();
+
+    if args.upgrade {
+        upgrade();
+        return;
+    }
 
     // Expand all patterns and collect unique files
     let mut all_files: HashSet<String> = HashSet::new();
@@ -96,13 +105,19 @@ fn main() {
             let percentage = (author_stats.lines as f64 / total_lines as f64) * 100.0;
             let last_touch = format_relative_time(author_stats.last_commit_time);
             println!(
-                "{:>5.1}%  {}  (last touched {})",
-                percentage, author, last_touch
+                "\x1b[38;5;208m{}\x1b[0m  {:>5.1}%  \x1b[2m(last touched {})\x1b[0m",
+                author, percentage, last_touch
             );
         }
         println!();
     } else {
-        println!("{}", authors[0].0);
+        let (author, author_stats) = &authors[0];
+        let percentage = (author_stats.lines as f64 / total_lines as f64) * 100.0;
+        let last_touch = format_relative_time(author_stats.last_commit_time);
+        println!(
+            "\x1b[38;5;208m{}\x1b[0m  {:>5.1}%  \x1b[2m(last touched {})\x1b[0m",
+            author, percentage, last_touch
+        );
     }
 }
 
@@ -249,4 +264,20 @@ fn format_relative_time(timestamp: i64) -> String {
     }
     let years = days / 365;
     format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
+}
+
+fn upgrade() {
+    println!("Upgrading blame...");
+
+    let status = Command::new("sh")
+        .args(["-c", "git clone https://github.com/flaque/blame /tmp/blame-upgrade 2>/dev/null || git -C /tmp/blame-upgrade pull && cargo install --path /tmp/blame-upgrade"])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => println!("Upgrade complete!"),
+        _ => {
+            eprintln!("Upgrade failed");
+            std::process::exit(1);
+        }
+    }
 }
