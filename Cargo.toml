@@ -1,0 +1,9 @@
+[package]
+name = "blame"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+glob = "0.3"
