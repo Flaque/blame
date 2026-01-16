@@ -8,6 +8,16 @@ use std::process::Command;
 #[derive(Parser)]
 #[command(name = "blame")]
 #[command(about = "Find out who is responsible for a file or folder")]
+#[command(after_help = "\
+EXAMPLES:
+    blame foo.rs              Blame a single file
+    blame foo.rs bar.rs       Blame multiple files
+    blame src/                Blame all files in a directory
+    blame \"**/*.rs\"           Blame all Rust files (glob pattern)
+    blame -v src/             Show all contributors with percentages
+    blame --gh src/           Output GitHub usernames (for PR reviewers)
+    blame --gh --only-name src/   Output just the username (for scripts)
+")]
 struct Args {
     /// Files, folders, or glob patterns to analyze (e.g., foo.rs bar.rs "**/*.rs")
     #[arg(required_unless_present = "upgrade")]
@@ -16,6 +26,14 @@ struct Args {
     /// Show detailed breakdown by contributor
     #[arg(short, long)]
     verbose: bool,
+
+    /// Output GitHub usernames instead of git author names
+    #[arg(long)]
+    gh: bool,
+
+    /// Only output the name (for use in scripts)
+    #[arg(long)]
+    only_name: bool,
 
     /// Upgrade blame to the latest version
     #[arg(long)]
@@ -26,6 +44,7 @@ struct Args {
 struct AuthorStats {
     lines: usize,
     last_commit_time: i64,
+    commits: HashSet<String>,
 }
 
 fn main() {
@@ -94,12 +113,33 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Resolve GitHub usernames if --gh flag is set
+    let stats = if args.gh {
+        match get_github_repo(&git_root) {
+            Some((owner, repo)) => resolve_github_usernames(stats, &owner, &repo),
+            None => {
+                eprintln!("Error: Could not determine GitHub repository from remote");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        stats
+    };
+
     let mut authors: Vec<_> = stats.into_iter().collect();
     authors.sort_by(|a, b| b.1.lines.cmp(&a.1.lines));
 
     let total_lines: usize = authors.iter().map(|(_, s)| s.lines).sum();
 
-    if args.verbose {
+    if args.only_name {
+        if args.verbose {
+            for (author, _) in &authors {
+                println!("{}", author);
+            }
+        } else {
+            println!("{}", authors[0].0);
+        }
+    } else if args.verbose {
         println!();
         for (author, author_stats) in &authors {
             let percentage = (author_stats.lines as f64 / total_lines as f64) * 100.0;
@@ -208,9 +248,13 @@ fn collect_blame_stats(
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut current_author: Option<String> = None;
     let mut current_time: i64 = 0;
+    let mut current_sha: Option<String> = None;
 
     for line in stdout.lines() {
-        if let Some(author) = line.strip_prefix("author ") {
+        // First line of each block starts with 40-char SHA
+        if line.len() >= 40 && line.chars().take(40).all(|c| c.is_ascii_hexdigit()) {
+            current_sha = Some(line[..40].to_string());
+        } else if let Some(author) = line.strip_prefix("author ") {
             current_author = Some(author.to_string());
         } else if let Some(time_str) = line.strip_prefix("author-time ") {
             if let Ok(time) = time_str.parse::<i64>() {
@@ -223,6 +267,9 @@ fn collect_blame_stats(
                 entry.lines += 1;
                 if current_time > entry.last_commit_time {
                     entry.last_commit_time = current_time;
+                }
+                if let Some(ref sha) = current_sha {
+                    entry.commits.insert(sha.clone());
                 }
             }
         }
@@ -264,6 +311,100 @@ fn format_relative_time(timestamp: i64) -> String {
     }
     let years = days / 365;
     format!("{} year{} ago", years, if years == 1 { "" } else { "s" })
+}
+
+fn get_github_repo(git_root: &Path) -> Option<(String, String)> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(git_root)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+    // Parse GitHub URL formats:
+    // https://github.com/owner/repo.git
+    // git@github.com:owner/repo.git
+    // https://github.com/owner/repo
+    if let Some(rest) = url.strip_prefix("https://github.com/") {
+        let rest = rest.trim_end_matches(".git");
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    } else if let Some(rest) = url.strip_prefix("git@github.com:") {
+        let rest = rest.trim_end_matches(".git");
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() == 2 {
+            return Some((parts[0].to_string(), parts[1].to_string()));
+        }
+    }
+
+    None
+}
+
+fn get_github_username(owner: &str, repo: &str, sha: &str) -> Option<String> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            &format!("repos/{}/{}/commits/{}", owner, repo, sha),
+            "--jq",
+            ".author.login",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let username = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if username.is_empty() || username == "null" {
+        None
+    } else {
+        Some(username)
+    }
+}
+
+fn resolve_github_usernames(
+    stats: HashMap<String, AuthorStats>,
+    owner: &str,
+    repo: &str,
+) -> HashMap<String, AuthorStats> {
+    let mut author_to_gh: HashMap<String, Option<String>> = HashMap::new();
+
+    // For each author, try to find their GitHub username from one of their commits
+    for (author, author_stats) in &stats {
+        if author_to_gh.contains_key(author) {
+            continue;
+        }
+        // Try the first commit to get the GitHub username
+        if let Some(sha) = author_stats.commits.iter().next() {
+            let gh_user = get_github_username(owner, repo, sha);
+            author_to_gh.insert(author.clone(), gh_user);
+        }
+    }
+
+    // Rebuild stats keyed by GitHub username (or fall back to git author name)
+    let mut new_stats: HashMap<String, AuthorStats> = HashMap::new();
+    for (author, author_stats) in stats {
+        let key = author_to_gh
+            .get(&author)
+            .and_then(|u| u.clone())
+            .unwrap_or(author);
+        let entry = new_stats.entry(key).or_default();
+        entry.lines += author_stats.lines;
+        if author_stats.last_commit_time > entry.last_commit_time {
+            entry.last_commit_time = author_stats.last_commit_time;
+        }
+        entry.commits.extend(author_stats.commits);
+    }
+
+    new_stats
 }
 
 fn upgrade() {
